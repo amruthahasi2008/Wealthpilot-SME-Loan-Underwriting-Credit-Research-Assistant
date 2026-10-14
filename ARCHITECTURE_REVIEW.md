@@ -9,7 +9,7 @@ lookups (not guesses), drafts and self-checks an underwriting memo through a
 multi-agent team, and routes the final decision through a durable,
 checkpointed workflow that knows when a human signatory is legally required.
 Every module is independently testable and every milestone passes its own
-checklist against real data — no step is simulated or hand-waved.
+checklist when run against the synthetic dataset.
 
 ## Components & data flow
 
@@ -17,23 +17,24 @@ checklist against real data — no step is simulated or hand-waved.
 |---|---|---|---|---|
 | M1 | Structured intake parser | Raw applicant narrative + attached financial figures | Validated `LoanApplication`/`FinancialSnapshot` (Pydantic) | — |
 | M2 | Tool-calling risk agent | A loan question | Cited recommendation, using 4 real tools (DSCR, EMI, bureau, bank statements) | M1's output as context |
-| M3 | Persistent memory + policy index | Applicant history / policy questions | Episodic recall, semantically-indexed policy chunks | Gemini embeddings |
-| M4 | Hybrid retrieval + grounded answers | A policy question | Cited answer, or an explicit "not addressed" (never fabricated) | M3's index |
+| M3 | Persistent memory + policy index | Applicant history / policy questions | Episodic recall, semantically-indexed policy chunks | Supermemory, Gemini embeddings |
+| M4 | Hybrid retrieval + grounded answers | A policy question | Cited answer, or an explicit "not addressed" (never fabricated) | M3's index, Qdrant Cloud |
 | M5 | Checkpointed underwriting workflow | A `LoanApplication` | approved / declined, with a real pause-and-resume on loans needing a human signatory | M1, M2, M4 |
 | M6 | Multi-agent memo drafting team | A `LoanApplication` | A fact-checked, reviewed underwriting memo, evidence via local calls or MCP | M1, M2, M4 |
 | M7 | Observability + reliability | The M6 team | A per-agent latency dashboard; a hardened tool call (retry → fallback → circuit breaker) | M6 |
-| M8 | Evaluation, guardrails, deployment | The full pipeline | 20-item scored golden set + bias-probe pairs + a live `/chat` API | M1–M6 |
+| M8 | Evaluation, guardrails, deployment | The full pipeline | 20-item scored golden set + bias-probe pairs + an LLM-judge spot check + a live `/chat` API | M1–M6 |
 
 ## Evaluation results summary
 
 - **M1**: 6/6 synthetic applications parsed, 6/6 exact match against the
   data generator's own ground truth (including one application with a
   deliberately missing field, handled without crashing).
-- **M4 retrieval**: precision/recall/MRR measured across factual,
-  multi-hop, and guardrail categories; the one unanswerable question
+- **M4 retrieval**: over 5 scored questions, hybrid+rerank reached
+  precision@5 0.60 / recall@5 0.71 / MRR 0.87 against 0.56 / 0.67 / 1.00 for
+  dense-only search — too small a set to separate them; the one unanswerable question
   (cryptocurrency collateral) correctly produced no fabricated citation.
 - **M6**: 11/11 milestone checklist items pass, including proof that local
-  and MCP-sourced evidence for the same query are byte-identical
+  and MCP-sourced runs return the same evidence ids
   (`['POLICY-84', 'POLICY-85', 'TOOL-BANK']` both ways).
 - **M7**: seeded fault injection is exactly reproducible; retry improves
   success rate from 57% to 89.5%; the fallback layer guarantees 100% of
@@ -41,6 +42,8 @@ checklist against real data — no step is simulated or hand-waved.
   failures and short-circuits the remaining 7 of 10 calls.
 - **M8 golden set**: 20/20 items pass across 4 independently-scored
   pipeline components (tool use, retrieval, planning, final answer).
+- **M8 LLM judges**: Ragas, DeepEval and TruLens scored one sample question
+  as a cross-check on the deterministic result, logged to Langfuse.
 - **M8 bias probe** *(added beyond the reference notebook — not present in
   the course template, built specifically because WealthPilot's own data
   generator produces matched bias pairs)*: 3/3 matched pairs — identical
@@ -57,8 +60,8 @@ checklist against real data — no step is simulated or hand-waved.
   injection vector, not just user queries.
 - **Structural fabrication check**: M4/M6's citation system means every
   policy claim traces to a real retrieved `[POLICY-#]`/`[TOOL-#]` id;
-  `fact_checker_node` (M6) deterministically strips any citation that
-  doesn't.
+  `fact_checker_node` (M6) deterministically flags any citation that
+  doesn't and sends the memo back for a rewrite.
 - **Fair-lending check**: the M8 bias-probe suite is the guardrail against
   the specific failure mode this domain cares about most — a system that
   reaches a different decision for two applicants with identical financials
@@ -70,11 +73,11 @@ checklist against real data — no step is simulated or hand-waved.
 
 ## Known limitations
 
-- The golden set (M8) is fully deterministic by design, given time
-  constraints — it does not yet cross-validate with an LLM-judge framework
-  (Ragas/DeepEval/TruLens, as the reference notebook demonstrates). A
-  production version should add at least one judge-based metric alongside
-  the deterministic scorers.
+- The golden set (M8) is fully deterministic. The LLM-judge cross-check
+  (Ragas/DeepEval/TruLens) scores a single sample question — a production
+  version should run the judges across the whole set.
+- M5's restart test reopens the checkpoint database inside one process; it
+  does not kill and relaunch the program.
 - The bias-probe suite covers 3 matched pairs across 3 sectors — a
   production fairness audit would run this across all 8 sectors and a wider
   set of demographic proxies (not just name/city).
@@ -93,7 +96,8 @@ checklist against real data — no step is simulated or hand-waved.
 
 - M8 ships a FastAPI service (`/health`, `/chat`) runnable via
   `uvicorn.Server` in a background thread — verified with real HTTP
-  requests against `127.0.0.1:8001` in `M8.py`'s own test run.
+  requests against `127.0.0.1:8001` in `M8.py`'s own test run, and reachable
+  through an ngrok tunnel when `NGROK_AUTHTOKEN` is set.
 - The MCP server (`wealthpilot_mcp_server.py`, M6) runs as a standalone
   stdio subprocess and can be consumed by any MCP-compatible client, not
   just this project's own agent code.
