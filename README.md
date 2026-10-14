@@ -1,170 +1,225 @@
 # WealthPilot — SME Loan Underwriting & Credit Research Assistant
 
-Capstone project for the Applied AI Professional Certification Program.
-Milestones M1–M5, built on synthetic data from the program's
-`capstone-data-toolkit` (domain: `wealthpilot`) — 13 credit policy documents,
-6 loan applications, and 4 mock API tables (`applicants`, `bureau_reports`,
-`bank_statements`, `past_decisions`).
+An AI assistant that takes a small-business loan application written in plain
+text and turns it into a policy-grounded underwriting recommendation. Every
+number is computed by code, every policy claim cites a real document, and
+large or borderline loans stop and wait for a human.
 
-Run each milestone independently: `python M1.py`, `python M2.py`, etc.
-(activate `venv` first, or call `./venv/bin/python M1.py` directly).
+Capstone project for the Applied AI Professional Certification Program
+(IIT Hyderabad). Built on synthetic data only: 13 credit-policy documents,
+6 loan applications, and 4 mock API tables for a fictional lender, Ashva
+Capital.
 
----
+## How it works
 
-## M1 — Provider-agnostic client + structured intake (`M1.py`)
+```
+loan application (free text)
+      │
+      ▼
+M1  structured intake ──► validated LoanApplication (Pydantic)
+      │
+      ▼
+M2  tool-calling agent ──► DSCR, EMI, credit bureau, bank statements
+      │
+      ▼
+M3  memory + policy index ─► past decisions (Supermemory), 89 policy chunks
+M4  hybrid retrieval ─────► cited answers from the policy corpus (Qdrant)
+      │
+      ▼
+M5  LangGraph workflow ───► auto-decide, or pause for a human signatory
+M6  multi-agent team ─────► fact-checked underwriting memo, tools over MCP
+      │
+      ▼
+M7  tracing + fault tolerance        M8  evaluation, guardrails, API
+```
 
-Parses a messy loan application (applicant narrative + attached financial
-figures) into a validated `LoanApplication` / `FinancialSnapshot` Pydantic
-object, via LiteLLM (provider-agnostic — currently Groq, falls back to
-OpenRouter) with a **repair loop**: invalid JSON or a schema mismatch is fed
-back to the model with the exact validation error, and retried.
+## Tech stack
 
-**Result:** 6/6 applications parsed successfully, 6/6 exact match against
-the generator's `declared_financials` ground truth (including one
-application with a deliberately missing field, handled without crashing).
+| Area | Tools |
+|---|---|
+| LLM access | LiteLLM (Groq `gpt-oss-120b`, OpenRouter fallback), Gemini for embeddings and judging |
+| Structured output | Pydantic v2, JSON mode, validation-error repair loop |
+| Agents and tools | LangChain (`tool()`, `ChatLiteLLM.bind_tools`), LangGraph |
+| Memory | Supermemory (applicant history) |
+| Retrieval | Qdrant Cloud, `gemini-embedding-001`, BM25 (`rank_bm25`), Reciprocal Rank Fusion, cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`) |
+| Workflow | LangGraph `StateGraph`, `interrupt()`, `SqliteSaver` checkpoints |
+| Tool protocol | Model Context Protocol (FastMCP server, `langchain-mcp-adapters` client) |
+| Reliability | `tenacity` retries, fallback path, circuit breaker, seeded fault injection |
+| Observability and evaluation | Langfuse, Ragas, DeepEval, TruLens |
+| Serving | FastAPI, uvicorn, ngrok |
 
-## M2 — Tool-enabled single agent (`M2.py`)
+## Milestones
 
-A credit-risk-analyst agent with 4 tools it must call rather than guess:
+### M1 — Structured intake (`M1.py`)
+
+Parses a messy application (applicant narrative plus attached form figures)
+into a validated `LoanApplication` object. If the model returns invalid JSON
+or the wrong shape, the exact validation error is sent back to the model and
+it retries (up to 2 repairs). Rate-limit errors back off and retry.
+
+**Result:** 6/6 applications parsed, 6/6 exact match against the data
+generator's ground truth, including one application with a deliberately
+missing field.
+
+### M2 — Tool-calling agent (`M2.py`)
+
+A credit-analyst agent with four tools it must call instead of guessing:
 `dscr_calculator`, `emi_calculator`, `mock_credit_bureau_api`,
-`mock_bank_statement_api` (the last two backed by the generator's CSV
-tables). Standard function-calling loop: model requests a tool, we execute
-it, feed the result back, repeat until it answers in plain text.
+`mock_bank_statement_api`. The tools are plain Python functions wrapped with
+LangChain's `tool()` and bound to a `ChatLiteLLM` model. The loop runs each
+requested tool, returns the result as a `ToolMessage`, and repeats until the
+model answers in plain text.
 
-**Result:** given a sample applicant and loan terms, the agent correctly
-called all 4 tools in a sensible order (bureau → bank statements → EMI →
-DSCR) and produced a cited recommendation with real computed figures.
+**Result:** for a sample applicant the agent called all four tools (bureau,
+bank statements, EMI, DSCR) and produced a recommendation using the computed
+figures.
 
-## M3 — Persistent memory + semantic policy index (`M3.py`)
+### M3 — Memory and policy index (`M3.py`)
 
-Two memory systems, both backed by Gemini embeddings with a disk cache:
-- **Applicant memory**: episodic entries seeded from `past_decisions.csv`,
-  recalled by semantic similarity, filterable per applicant.
-- **Policy index**: the 13 policy documents chunked and embedded for
-  semantic search.
+- **Applicant memory:** past loan decisions stored in Supermemory and
+  recalled by meaning, filterable per applicant.
+- **Policy index:** the 13 policy documents split into 89 chunks and embedded
+  with Gemini embeddings (cached on disk).
 
-**Result:** episodic recall correctly retrieved the exact past decision for
-a sampled applicant; policy search correctly surfaced the **textiles-sector
-DSCR floor (1.40x)** as the top hit for a textiles-specific query, distinct
-from the default 1.25x floor.
+**Result:** recall returned the correct past decision for a sampled
+applicant; a textiles question surfaced the textiles-specific DSCR floor
+(1.40x) rather than the default 1.25x.
 
-## M4 — Production RAG + retrieval evaluation (`M4.py`)
+### M4 — Hybrid retrieval with cited answers (`M4.py`)
 
-Upgrades M3's plain dense search: **BM25 + dense fused with Reciprocal Rank
-Fusion**, a **cross-encoder rerank** pass, and **grounded, cited answer
-generation** with a structural prompt-injection defense (policy text is
-treated as untrusted data, not instructions). A golden eval set scores
-precision@k / recall@k / MRR across `naive-dense` vs `hybrid+rerank`.
+Dense search on a Qdrant Cloud collection and BM25 keyword search are fused
+with Reciprocal Rank Fusion, then a cross-encoder reranks the top candidates.
+Answers must cite the chunks they use. Retrieved policy text is treated as
+untrusted data, never as instructions.
 
-**Result:** retrieval metrics computed across factual/multi-hop/guardrail/
-unanswerable categories. Critically, on the unanswerable question ("what's
-our policy on crypto collateral?"), the system correctly stated the manual
-doesn't address it **instead of fabricating a citation** — the compliance
-failure mode this milestone specifically guards against.
+A small golden set (5 scored questions plus 1 unanswerable) compares plain
+dense search with hybrid + rerank, and both runs are logged to Langfuse.
 
-## M5 — Orchestrated workflow with a durable human-approval checkpoint (`M5.py`)
+| Variant | precision@5 | recall@5 | MRR |
+|---|---|---|---|
+| Dense only | 0.56 | 0.67 | 1.00 |
+| Hybrid + rerank | 0.60 | 0.71 | 0.87 |
 
-Rebuilt to match the course's own reference skeleton: a LangGraph state
-machine with an explicit control/audit field split (`missing_fields` etc.
-overwrite; `audit_log` accumulates), `intake → verify_documents → backfill
-(loop, capped) → risk_scoring` (DSCR against the sector-specific floor
-pulled live from M4's index) `→ conditional routing`. Loans under the
-₹5,000,000 signatory threshold with a clear DSCR outcome are auto-decided;
-everything else **pauses the graph** via `interrupt()`, persisted to a real
-**SQLite file** (not just in-memory), and waits for a human.
+**Result:** hybrid + rerank was slightly better on precision and recall and
+slightly worse on MRR (one question ranked its best chunk third). Five
+questions is too few to call a winner. On the unanswerable question ("what is
+our policy on cryptocurrency collateral?") the system said the manual does
+not cover it instead of inventing a citation.
 
-**Result:** a small loan auto-declined with no human involved. A
-₹6,000,000 loan correctly paused. The run then **rebuilds the graph from a
-completely fresh SQLite connection** — simulating a real process restart —
-and proves the paused state survives it, before resuming with a simulated
-human decision. 8/8 milestone checklist items pass.
+### M5 — Workflow with a human-approval checkpoint (`M5.py`)
 
-## M6 — Multi-agent memo-drafting team + a custom MCP server (`M6.py`, `wealthpilot_mcp_server.py`)
+A LangGraph state machine: `intake → verify_documents → backfill (capped
+loop) → risk_scoring → auto_decision or human_gate → finalize_human`. Risk
+scoring compares DSCR with the sector-specific floor retrieved from the
+policy index. Loans above INR 5,000,000, borderline cases, and applications
+with unresolved documents pause at `interrupt()` and wait for a human. State
+is checkpointed to a SQLite file.
 
-A supervisor-routed team (Planner, Researcher, Writer, independent
-Fact-Checker, Reviewer, Escalate) drafts and self-checks an underwriting
-memo. Each agent has an **enforced write scope** (a `PermissionError` if a
-node writes outside its role); the Supervisor's LLM-proposed routing is
-only ever honored if it matches a deterministically-computed legal move.
-The Fact-Checker independently verifies every `[POLICY-#]`/`[TOOL-#]`
-citation in the draft traces to real retrieved evidence. A standalone
-**FastMCP server** exposes WealthPilot's real tools (bureau, bank
-statements, DSCR/EMI, policy search) sandboxed to its own workspace; the
-team's Researcher is swapped to pull evidence over MCP instead of local
-calls, consumed two ways (direct tool list + a stateful session).
+**Result:** a small loan was auto-decided with no human involved. The largest
+loan paused; the graph was then rebuilt on a fresh SQLite connection
+(simulating a restart), the paused state was still there, and the run resumed
+with a human decision. 8/8 checklist items pass.
 
-**Result:** a fabricated citation was caught and flagged. The sandbox
-rejected all path-escape attempts. Local and MCP-sourced evidence for the
-same query were **byte-identical**. 11/11 milestone checklist items pass.
+### M6 — Multi-agent team and MCP server (`M6.py`, `wealthpilot_mcp_server.py`)
 
-## M7 — Observability + reliability hardening (`M7.py`)
+A supervisor routes work between five specialists (Planner, Researcher,
+Writer, Fact-Checker, Reviewer) with an escalation path to a human.
 
-Wraps the M6 team with span-timing decorators (Langfuse-backed if keys are
-configured, degrading gracefully to a local dashboard otherwise) and builds
-a real per-agent cost/latency table. Separately, a **seeded** fault-injection
-harness wraps a real tool call with reproducible failure rates, hardened in
-three independently-measured steps: `tenacity` retry+backoff, a fallback
-path, and a 3-state circuit breaker.
+- Each agent may only write its own part of the shared state; anything else
+  raises a `PermissionError`.
+- The supervisor's LLM-proposed route is only used if it matches the route a
+  plain Python function computed.
+- The Fact-Checker is deterministic: every `[POLICY-#]` / `[TOOL-#]` citation
+  in the memo must match evidence that was actually retrieved.
 
-**Result:** tracing added zero behavior change (traced/untraced outputs are
-identical). The dashboard showed the Supervisor's routing calls dominate
-cost (~9.6s across 8 calls) while deterministic nodes are near-free. The
-fault harness: baseline 57% → +retry 89.5% → +fallback 100% (never raises)
-→ circuit breaker opens after exactly 3 real failures and short-circuits
-the remaining 7 of 10 calls. Same seed reproduces the exact same numbers
-every run. 8/8 milestone checklist items pass.
+A standalone FastMCP server exposes the underwriting tools and a
+citation-rules resource over stdio, with file access sandboxed to its own
+workspace. The Researcher can pull evidence over MCP instead of local calls,
+and the server is consumed three ways: a direct tool list, a stateful
+session, and a generic ReAct agent.
 
-## M8 — Evaluation, guardrails, bias testing, deployment (`M8.py`)
+**Result:** a fabricated citation was caught, a reviewer trying to overwrite
+the draft was blocked, all path-escape attempts on the sandbox were rejected,
+and local and MCP runs returned the same evidence. 11/11 checklist items
+pass.
 
-A 20-item golden dataset scores 4 pipeline components independently (tool
-use, retrieval, planning, final answer) — all deterministic, by design,
-given time constraints (see `ARCHITECTURE_REVIEW.md` for what a production
-version would add). **Added beyond the reference notebook, which has no
-equivalent**: a bias-probe suite of 3 matched applicant pairs — identical
-financials, only name/city differing — run through the real M1 parser and
-decision logic. Guardrails (Pydantic schema + regex prompt-injection scan,
-covering both user input *and* retrieved policy text) gate every response.
-The pipeline ships as a real FastAPI service (`/health`, `/chat`).
+### M7 — Observability and reliability (`M7.py`)
 
-**Result:** 20/20 golden items pass. **All 3 bias-probe pairs reached
-identical decisions** — no fair-lending divergence detected. All 4
-guardrail test cases behaved correctly. The FastAPI service answered real
-HTTP requests end to end. 7/7 milestone checklist items pass.
+Wraps each agent with timing spans (sent to Langfuse when keys are set,
+always recorded locally) and builds a per-agent latency table. Separately, a
+seeded fault-injection harness makes a real tool call fail at a fixed,
+repeatable rate (200 calls, seed 42) and measures three hardening steps.
 
----
+| Step | Success rate |
+|---|---|
+| Baseline | 57% |
+| + retry with backoff | 89.5% |
+| + fallback | 100% (no call raises; 21 of 200 served by the fallback) |
 
-## Architecture
+**Result:** tracing did not change the team's output. The circuit breaker
+opened after exactly 3 failures and short-circuited the remaining 7 of 10
+calls. The same seed reproduces the same numbers. 8/8 checklist items pass.
 
-```
-data/wealthpilot/                  <- generated by capstone-data-toolkit
-  corpus/markdown/*.md             <- 13 policy docs -> M3/M4 index
-  intake/records.jsonl             <- 6 applications -> M1 input
-  mock_api/*.csv                   <- 4 tables -> M2 tool backends
+### M8 — Evaluation, guardrails, bias testing, deployment (`M8.py`)
 
-M1.py  parse_loan_application()  ──┐
-M2.py  run_agent(), 4 tools       ─┼─► M5.py: checkpointed workflow (intake→docs→risk→route)
-M4.py  retrieve(), answer()       ─┤   M6.py: multi-agent memo team, local or MCP evidence
-M3.py  remember()/recall(), index ─┘   M7.py: traces + hardens the M6 team
-                                        M8.py: scores, guards, and deploys the whole pipeline
+- **Golden set:** 20 deterministic checks, 5 each for tool use, retrieval,
+  planning, and final answer, so a failure shows which part broke.
+- **Bias probe:** 3 matched pairs with identical financials and only the
+  applicant name and city changed.
+- **LLM judges:** Ragas, DeepEval, and TruLens score one sample question as a
+  cross-check on the deterministic result, logged to Langfuse.
+- **Guardrails:** a Pydantic schema for every response and a prompt-injection
+  scan over both user input and retrieved policy text.
+- **Service:** a FastAPI app (`/health`, `/chat`), also reachable through an
+  ngrok tunnel.
 
-wealthpilot_mcp_server.py  <- standalone MCP server (M6), exposes M2/M4's tools over stdio
-workflow_checkpoints.sqlite <- M5's durable checkpoint store
-```
+**Result:** 20/20 golden items pass, all 3 bias pairs reached identical
+decisions, 4/4 guardrail cases behaved correctly, and the API answered real
+HTTP requests locally and over the tunnel. 9/9 checklist items pass.
 
-## Reference materials
+## Repository contents
 
-`M5.py` through `M8.py` were built to match the Applied AI program's own
-reference notebooks for those milestones (generic templates covering a
-document-approval workflow, a research-team multi-agent pattern, and a
-campus-library toy pipeline respectively), re-derived onto WealthPilot's
-actual loan-underwriting domain and data. See `ARCHITECTURE_REVIEW.md` for
-the full write-up (system overview, data flow, evaluation results,
-guardrails, known limitations, deployment notes) and `DEMO_SCRIPT.md` for a
-presenter's script covering all 8 milestones.
+| File | Purpose |
+|---|---|
+| `M1.py` – `M8.py` | One file per milestone; later files import earlier ones |
+| `wealthpilot_mcp_server.py` | Standalone MCP server used by M6 |
+| `workflow_checkpoints.sqlite` | M5's checkpoint store |
+| `ARCHITECTURE_REVIEW.md` | Longer design write-up |
 
-## Status
+## Running it
 
-M1 through M8 — the full 8-milestone rubric — are built and verified.
-Every milestone's own checklist (mirroring the reference notebooks' grading
-rubrics where one exists) is passing against real runs, not simulated
-output. There is no M9; M8 is the final milestone in this program.
+The data folder and API keys are not included in this repository.
+
+1. Install the packages:
+
+   ```bash
+   pip install litellm python-dotenv pydantic langchain langchain-core langchain-litellm langchain-google-genai langchain-mcp-adapters langgraph langgraph-checkpoint-sqlite supermemory qdrant-client rank-bm25 sentence-transformers numpy pandas fastmcp tenacity langfuse ragas deepeval trulens-providers-litellm openai fastapi uvicorn pyngrok requests certifi
+   ```
+
+2. Place the generated dataset at `data/wealthpilot/` (`corpus/markdown/`,
+   `intake/records.jsonl`, `mock_api/*.csv`).
+
+3. Create a `.env` file with:
+
+   - `GROQ_API_KEY` (or `OPENROUTER_API_KEY` and `OPENROUTER_MODEL`)
+   - `GEMINI_API_KEY`
+   - `SUPERMEMORY_API_KEY`
+   - `QDRANT_URL`, `QDRANT_API_KEY`
+   - `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` (optional, for tracing)
+   - `NGROK_AUTHTOKEN` (needed for M8's public-tunnel check)
+
+4. Run any milestone on its own:
+
+   ```bash
+   python M1.py
+   ```
+
+## Limitations
+
+- All data is synthetic; nothing here has been tested on real loan documents.
+- The evaluation sets are small: 5 scored retrieval questions, 20 golden
+  checks, 3 bias pairs, and 1 question scored by the LLM judges.
+- The restart test reopens the checkpoint database inside one process rather
+  than killing and relaunching the program.
+- The multi-agent team is exercised on one applicant per run; it has not been
+  load-tested.
